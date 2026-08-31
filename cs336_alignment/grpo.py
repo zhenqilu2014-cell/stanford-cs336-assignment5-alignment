@@ -196,6 +196,8 @@ def compute_group_normalized_rewards(
     grouped_std = torch.std(grouped_rewards, dim = 1, keepdim = True)
     if baseline == "mean":
         grouped_rewards = grouped_rewards - grouped_mean
+    elif baseline == "none":
+        pass
     if advantage_normalizer == "std":
         grouped_rewards = grouped_rewards / (grouped_std + advantage_eps)
     elif advantage_normalizer == "mean":
@@ -257,7 +259,21 @@ def compute_policy_gradient_loss(
         raise NotImplementedError(f"importance_reweighting_method {importance_reweighting_method} not supported")
     if raw_rewards_or_advantages.ndim == 1:
         raw_rewards_or_advantages = raw_rewards_or_advantages.unsqueeze(-1)
-    per_token_policy_gradient_loss = -raw_rewards_or_advantages * policy_log_probs
+    if importance_reweighting_method == "none":
+        per_token_policy_gradient_loss = -raw_rewards_or_advantages * policy_log_probs
+    elif importance_reweighting_method == "noclip":
+        ratio = torch.exp(policy_log_probs - old_log_probs)
+        per_token_policy_gradient_loss = -raw_rewards_or_advantages * ratio
+    elif importance_reweighting_method == "grpo":
+        ratio = torch.exp(policy_log_probs - old_log_probs)
+        clipped_ratio = torch.clip(ratio, 1.0 - cliprange, 1.0 + cliprange)
+        per_token_policy_gradient_loss = -torch.minimum(raw_rewards_or_advantages * ratio, raw_rewards_or_advantages * clipped_ratio)
+    elif importance_reweighting_method == "gspo":
+        sequence_log_ratio = torch.sum((policy_log_probs - old_log_probs) * response_mask, dim = 1, keepdim = True) / torch.sum(response_mask, dim = 1, keepdim = True)
+        sequence_ratio = torch.exp(sequence_log_ratio)
+        clipped_ratio = torch.clip(sequence_ratio, 1.0 - cliprange, 1.0 + cliprange)
+        sequence_policy_gradient_loss = -torch.minimum(raw_rewards_or_advantages * sequence_ratio, raw_rewards_or_advantages * clipped_ratio)
+        per_token_policy_gradient_loss = sequence_policy_gradient_loss + torch.zeros_like(policy_log_probs)
     metadata = {}
     return per_token_policy_gradient_loss, metadata
 
@@ -432,14 +448,28 @@ def grpo_train_step(
             return_token_entropy = False,
         )
 
-        gradient_loss, gradient_loss_metadata = compute_policy_gradient_loss(
-            raw_rewards_or_advantages = advantages[i: i + microbatch_size],
-            policy_log_probs = log_probs["log_probs"],
-            importance_reweighting_method = importance_reweighting_method,
-            # old_log_probs = old_log_probs[i: i + microbatch_size, :],
-            cliprange = cliprange,
-            response_mask = tokenized_microbatch["response_mask"]
-        )
+        if importance_reweighting_method != "none" and old_log_probs is None:
+            raise ValueError("old_log_probs must be provided when importance_reweighting_method is not 'none'")
+        if importance_reweighting_method == "none":
+            gradient_loss, gradient_loss_metadata = compute_policy_gradient_loss(
+                raw_rewards_or_advantages = advantages[i: i + microbatch_size],
+                policy_log_probs = log_probs["log_probs"],
+                importance_reweighting_method = importance_reweighting_method,
+                # old_log_probs = old_log_probs[i: i + microbatch_size, :],
+                cliprange = cliprange,
+                response_mask = tokenized_microbatch["response_mask"]
+            )
+        else:
+            current_sequence_length = log_probs["log_probs"].shape[1]
+            old_probs_microbatch = old_log_probs[i: i + microbatch_size, :current_sequence_length].to(device)
+            gradient_loss, gradient_loss_metadata = compute_policy_gradient_loss(
+                raw_rewards_or_advantages = advantages[i: i + microbatch_size],
+                policy_log_probs = log_probs["log_probs"],
+                importance_reweighting_method = importance_reweighting_method,
+                old_log_probs = old_probs_microbatch,
+                cliprange = cliprange,
+                response_mask = tokenized_microbatch["response_mask"]
+            )
 
         loss_microbatch = aggregate_loss_across_microbatch(
             per_token_policy_gradient_loss = gradient_loss,
@@ -447,7 +477,8 @@ def grpo_train_step(
             loss_normalization = loss_normalization,
             normalization_constant = normalization_constant
         )
-        loss_microbatch = loss_microbatch / gradient_accumulation_steps
+        if loss_normalization == "sequence":
+            loss_microbatch = loss_microbatch / gradient_accumulation_steps
         loss_microbatch.backward()
         total_loss = total_loss + loss_microbatch.detach()
 
